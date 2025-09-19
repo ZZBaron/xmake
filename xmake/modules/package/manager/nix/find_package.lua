@@ -228,7 +228,7 @@ function _validate_package_in_store_path(store_path, name)
     return false
 end
 
--- find package in a specific nix store path with validation
+-- find package in a specific nix store path - now uses ALL available content
 function _find_in_store_path(store_path, name)
     
     if not os.isdir(store_path) then
@@ -248,14 +248,20 @@ function _find_in_store_path(store_path, name)
         result.includedirs = {includedir}
     end
     
-    -- Find libraries
+    -- Find bin directory
+    local bindir = path.join(store_path, "bin")
+    if os.isdir(bindir) then
+        result.bindirs = {bindir}
+    end
+    
+    -- Find libraries - use all libraries in the lib directory
     local libdir = path.join(store_path, "lib")
     if os.isdir(libdir) then
         result.linkdirs = {libdir}
         result.links = {}
         result.libfiles = {}
         
-        -- Scan for library files related to our package
+        -- Scan for all library files in the lib directory
         local libfiles = os.files(path.join(libdir, "*.so*"), 
                                 path.join(libdir, "*.a"), 
                                 path.join(libdir, "*.dylib*"))
@@ -267,10 +273,9 @@ function _find_in_store_path(store_path, name)
                            filename:match("^lib(.+)%.dylib")
             
             if linkname then
-                if linkname == name or linkname:find(name, 1, true) then
-                    table.insert(result.links, linkname)
-                    table.insert(result.libfiles, libfile)
-                end
+                -- Add all libraries found
+                table.insert(result.links, linkname)
+                table.insert(result.libfiles, libfile)
                 
                 if filename:endswith(".a") then
                     result.static = true
@@ -281,28 +286,49 @@ function _find_in_store_path(store_path, name)
         end
     end
     
-    -- Find pkg-config files
+    -- Find ALL pkg-config files in the store path
     local pkgconfigdirs = {
         path.join(store_path, "lib", "pkgconfig"),
         path.join(store_path, "share", "pkgconfig")
     }
     
+    local pcfiles_found = {}
     for _, pcdir in ipairs(pkgconfigdirs) do
         if os.isdir(pcdir) then
-            local pcfiles = os.files(path.join(pcdir, name .. ".pc"))
-            if #pcfiles > 0 then
-                -- Use pkg-config with configdirs
+            -- Get all .pc files
+            local all_pcfiles = os.files(path.join(pcdir, "*.pc"))
+            for _, pcfile in ipairs(all_pcfiles) do
+                table.insert(pcfiles_found, pcfile)
+            end
+        end
+    end
+    
+    -- If we found pkg-config files, try to use the one matching our package name first
+    if #pcfiles_found > 0 then
+        -- First try the exact match
+        for _, pcfile in ipairs(pcfiles_found) do
+            local pcname = path.basename(pcfile):gsub("%.pc$", "")
+            if pcname == name then
+                local pcdir = path.directory(pcfile)
                 local pcresult = find_package_from_pkgconfig(name, {configdirs = pcdir})
-                
                 if pcresult then
                     return pcresult
                 end
             end
         end
+        
+        -- If no exact match, try the first available pkg-config file
+        local first_pcfile = pcfiles_found[1]
+        local pcdir = path.directory(first_pcfile)
+        local first_pcname = path.basename(first_pcfile):gsub("%.pc$", "")
+        local pcresult = find_package_from_pkgconfig(first_pcname, {configdirs = pcdir})
+        if pcresult then
+            return pcresult
+        end
     end
     
     -- Return result if we found anything useful
-    if result.includedirs or (result.links and #result.links > 0) then
+    if result.includedirs or result.bindirs or (result.links and #result.links > 0) then
         return result
     end
     
