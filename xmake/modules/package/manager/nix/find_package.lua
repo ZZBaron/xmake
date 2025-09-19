@@ -186,6 +186,47 @@ function _get_available_nix_paths()
     return paths
 end
 
+-- find all outputs for a given package name by searching nix store
+function _find_all_package_outputs(package_name)
+    local all_outputs = {}
+    local seen = {}
+    
+    -- First get paths from environment
+    local env_paths = _get_available_nix_paths()
+    
+    for _, store_path in ipairs(env_paths) do
+        local path_name = path.basename(store_path):lower()
+        local search_name = package_name:lower()
+        
+        -- Check if this path matches the package name
+        if path_name:find(search_name, 1, true) then
+            if not seen[store_path] then
+                seen[store_path] = true
+                table.insert(all_outputs, store_path)
+            end
+        end
+    end
+    
+    -- Also search /nix/store directly for all outputs of this package
+    local store_dir = "/nix/store"
+    if os.isdir(store_dir) then
+        local entries = try {function() return os.dirs(store_dir .. "/*") end} or {}
+        
+        for _, entry in ipairs(entries) do
+            local entry_name = path.basename(entry):lower()
+            local search_name = package_name:lower()
+            
+            -- Match patterns like: hash-packagename-version, hash-packagename-version-output
+            if entry_name:find(search_name, 1, true) and not seen[entry] then
+                seen[entry] = true
+                table.insert(all_outputs, entry)
+            end
+        end
+    end
+    
+    return all_outputs
+end
+
 -- check if a store path actually contains the requested package
 function _validate_package_in_store_path(store_path, name)
     
@@ -228,107 +269,124 @@ function _validate_package_in_store_path(store_path, name)
     return false
 end
 
--- find package in a specific nix store path
-function _find_in_store_path(store_path, name)
-    
-    if not os.isdir(store_path) then
-        return nil
-    end
-    
-    -- First validate that this store path actually contains our package
-    if not _validate_package_in_store_path(store_path, name) then
-        return nil
-    end
-    
-    local result = {}
-    
-    -- Find include directories
-    local includedir = path.join(store_path, "include")
-    if os.isdir(includedir) then
-        result.includedirs = {includedir}
-    end
-    
-    -- Find bin directory
-    local bindir = path.join(store_path, "bin")
-    if os.isdir(bindir) then
-        result.bindirs = {bindir}
-    end
-    
-    -- Find libraries - use all libraries in the lib directory
-    local libdir = path.join(store_path, "lib")
-    if os.isdir(libdir) then
-        result.linkdirs = {libdir}
-        result.links = {}
-        result.libfiles = {}
-        
-        -- Scan for all library files in the lib directory
-        local libfiles = os.files(path.join(libdir, "*.so*"), 
-                                path.join(libdir, "*.a"), 
-                                path.join(libdir, "*.dylib*"))
-        
-        for _, libfile in ipairs(libfiles) do
-            local filename = path.filename(libfile)
-            local linkname = filename:match("^lib(.+)%.so") or 
-                           filename:match("^lib(.+)%.a") or 
-                           filename:match("^lib(.+)%.dylib")
-            
-            if linkname then
-                -- Add all libraries found
-                table.insert(result.links, linkname)
-                table.insert(result.libfiles, libfile)
-                
-                if filename:endswith(".a") then
-                    result.static = true
-                else
-                    result.shared = true
-                end
-            end
-        end
-    end
-    
-    -- Find ALL pkg-config files in the store path
-    local pkgconfigdirs = {
-        path.join(store_path, "lib", "pkgconfig"),
-        path.join(store_path, "share", "pkgconfig")
+-- combine all outputs into a single result
+function _combine_all_outputs(all_outputs, name)
+    local result = {
+        includedirs = {},
+        bindirs = {},
+        linkdirs = {},
+        links = {},
+        libfiles = {}
     }
     
-    local pcfiles_found = {}
-    for _, pcdir in ipairs(pkgconfigdirs) do
-        if os.isdir(pcdir) then
-            -- Get all .pc files
-            local all_pcfiles = os.files(path.join(pcdir, "*.pc"))
-            for _, pcfile in ipairs(all_pcfiles) do
-                table.insert(pcfiles_found, pcfile)
+    -- Validate that at least one output contains our package
+    local has_package = false
+    for _, output_path in ipairs(all_outputs) do
+        if _validate_package_in_store_path(output_path, name) then
+            has_package = true
+            break
+        end
+    end
+    
+    if not has_package then
+        return nil
+    end
+    
+    -- Try pkg-config first from any output
+    for _, output_path in ipairs(all_outputs) do
+        local pkgconfigdirs = {
+            path.join(output_path, "lib", "pkgconfig"),
+            path.join(output_path, "share", "pkgconfig")
+        }
+        
+        for _, pcdir in ipairs(pkgconfigdirs) do
+            if os.isdir(pcdir) then
+                -- Try exact match first
+                local exact_pcfile = path.join(pcdir, name .. ".pc")
+                if os.isfile(exact_pcfile) then
+                    local pcresult = find_package_from_pkgconfig(name, {configdirs = pcdir})
+                    if pcresult then
+                        -- Still need to add all directories from all outputs
+                        goto collect_all_paths
+                    end
+                end
             end
         end
     end
     
-    -- If we found pkg-config files, try to use the one matching our package name first
-    if #pcfiles_found > 0 then
-        -- First try the exact match
-        for _, pcfile in ipairs(pcfiles_found) do
-            local pcname = path.basename(pcfile):gsub("%.pc$", "")
-            if pcname == name then
-                local pcdir = path.directory(pcfile)
-                local pcresult = find_package_from_pkgconfig(name, {configdirs = pcdir})
-                if pcresult then
-                    return pcresult
+    ::collect_all_paths::
+    
+    -- Collect all directories from all outputs
+    for _, output_path in ipairs(all_outputs) do
+        if not os.isdir(output_path) then
+            goto continue
+        end
+        
+        -- Add include directories
+        local includedir = path.join(output_path, "include")
+        if os.isdir(includedir) then
+            table.insert(result.includedirs, includedir)
+        end
+        
+        -- Add bin directories
+        local bindir = path.join(output_path, "bin")
+        if os.isdir(bindir) then
+            table.insert(result.bindirs, bindir)
+        end
+        
+        -- Add lib directories and scan for libraries
+        local libdir = path.join(output_path, "lib")
+        if os.isdir(libdir) then
+            table.insert(result.linkdirs, libdir)
+            
+            -- Scan for library files
+            local libfiles = os.files(path.join(libdir, "*.so*"), 
+                                    path.join(libdir, "*.a"), 
+                                    path.join(libdir, "*.dylib*"))
+            
+            for _, libfile in ipairs(libfiles) do
+                local filename = path.filename(libfile)
+                local linkname = filename:match("^lib(.+)%.so") or 
+                               filename:match("^lib(.+)%.a") or 
+                               filename:match("^lib(.+)%.dylib")
+                
+                if linkname then
+                    table.insert(result.links, linkname)
+                    table.insert(result.libfiles, libfile)
+                    
+                    if filename:endswith(".a") then
+                        result.static = true
+                    else
+                        result.shared = true
+                    end
                 end
             end
         end
         
-        -- If no exact match, try the first available pkg-config file
-        local first_pcfile = pcfiles_found[1]
-        local pcdir = path.directory(first_pcfile)
-        local first_pcname = path.basename(first_pcfile):gsub("%.pc$", "")
-        local pcresult = find_package_from_pkgconfig(first_pcname, {configdirs = pcdir})
-        if pcresult then
-            return pcresult
-        end
+        ::continue::
     end
     
+    -- Remove duplicates from all arrays
+    local function remove_duplicates(arr)
+        local seen = {}
+        local clean = {}
+        for _, item in ipairs(arr) do
+            if not seen[item] then
+                seen[item] = true
+                table.insert(clean, item)
+            end
+        end
+        return clean
+    end
+    
+    result.includedirs = remove_duplicates(result.includedirs)
+    result.bindirs = remove_duplicates(result.bindirs)
+    result.linkdirs = remove_duplicates(result.linkdirs)
+    result.links = remove_duplicates(result.links)
+    result.libfiles = remove_duplicates(result.libfiles)
+    
     -- Return result if we found anything useful
-    if result.includedirs or result.bindirs or (result.links and #result.links > 0) then
+    if (#result.includedirs > 0) or (#result.bindirs > 0) or (#result.links > 0) then
         return result
     end
     
@@ -342,12 +400,22 @@ function _try_modern_nix_build(name)
         return nil
     end
     
-    -- Try with flakes syntax
-    local storepath = try {function()
+    -- Try with flakes syntax - build all outputs
+    local outputs = try {function()
         return os.iorunv(nix.program, {"build", "nixpkgs#" .. name, "--print-out-paths", "--no-link"}):trim()
     end}
     
-    return storepath
+    if outputs then
+        local paths = {}
+        for line in outputs:gmatch("[^\n]+") do
+            if os.isdir(line) then
+                table.insert(paths, line)
+            end
+        end
+        return paths
+    end
+    
+    return nil
 end
 
 -- try to build package with legacy nix
@@ -362,7 +430,11 @@ function _try_legacy_nix_build(name)
         return os.iorunv(nix_build.program, {"<nixpkgs>", "-A", name, "--no-out-link"}):trim()
     end}
     
-    return storepath
+    if storepath and os.isdir(storepath) then
+        return {storepath}
+    end
+    
+    return nil
 end
 
 -- main find function
@@ -382,39 +454,51 @@ function main(name, opt)
         force_nix = true
     end
     
-    -- Get all available Nix store paths
-    local nix_paths = _get_available_nix_paths()
+    -- Find all outputs for this package in the environment
+    local all_outputs = _find_all_package_outputs(actual_name)
     
-    -- Search through available paths first (prioritize shell environment)
-    if #nix_paths > 0 then
-        for i, store_path in ipairs(nix_paths) do
-            local result = _find_in_store_path(store_path, actual_name)
-            if result then
-                if opt.verbose or option.get("verbose") then
-                    print("Found " .. actual_name .. " in: " .. store_path)
+    if #all_outputs > 0 then
+        local result = _combine_all_outputs(all_outputs, actual_name)
+        if result then
+            if opt.verbose or option.get("verbose") then
+                print("Found " .. actual_name .. " with " .. #all_outputs .. " outputs:")
+                for _, output in ipairs(all_outputs) do
+                    print("  " .. output)
                 end
-                return result
             end
+            return result
         end
     end
     
     -- If not found in available paths and not in nix-shell, try building
     if not _in_nix_shell() or force_nix then
-        local storepath = nil
+        local storepaths = nil
         
         -- Try modern nix first
-        storepath = _try_modern_nix_build(actual_name)
+        storepaths = _try_modern_nix_build(actual_name)
         
         -- Fallback to legacy nix-build
-        if not storepath then
-            storepath = _try_legacy_nix_build(actual_name)
+        if not storepaths then
+            storepaths = _try_legacy_nix_build(actual_name)
         end
         
-        if storepath and os.isdir(storepath) then
-            local result = _find_in_store_path(storepath, actual_name)
+        if storepaths then
+            -- Find all related outputs for the built paths
+            local all_built_outputs = {}
+            for _, built_path in ipairs(storepaths) do
+                local related = _find_all_package_outputs(actual_name)
+                for _, related_path in ipairs(related) do
+                    table.insert(all_built_outputs, related_path)
+                end
+            end
+            
+            local result = _combine_all_outputs(all_built_outputs, actual_name)
             if result then
                 if opt.verbose or option.get("verbose") then
-                    print("Built and found " .. actual_name .. " in: " .. storepath)
+                    print("Built and found " .. actual_name .. " with " .. #all_built_outputs .. " outputs:")
+                    for _, output in ipairs(all_built_outputs) do
+                        print("  " .. output)
+                    end
                 end
                 return result
             end
