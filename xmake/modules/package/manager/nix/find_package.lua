@@ -228,7 +228,7 @@ function _validate_package_in_store_path(store_path, name)
     return false
 end
 
--- find package in a specific nix store path - now uses ALL available content
+-- find package in a specific nix store path
 function _find_in_store_path(store_path, name)
     
     if not os.isdir(store_path) then
